@@ -19,7 +19,7 @@ jobs:
           username: ${{ secrets.MAIL_USERNAME }}
           password: ${{ secrets.MAIL_PASSWORD }}
           subject: "Approval Required: Build Pipeline"
-          to: manager@company.com
+          to: durgasatyanarayana52@gmail.com
           from: GitHub-Actions
           body: |
             A new code push to master requires approval before build starts.
