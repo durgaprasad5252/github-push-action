@@ -7,9 +7,27 @@ on:
 
 jobs:
 
+  send-approval-mail:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Send Approval Email
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          subject: "Approval Required for Build Pipeline"
+          body: "A new code push to master requires approval before build starts."
+          to: durgasatyanarayana52@gmail.com
+          from: GitHub-Actions
+
   approval-before-build:
     runs-on: ubuntu-latest
+    needs: send-approval-mail
     environment: build-approval
+
     steps:
       - name: Waiting for Approval
         run: echo "Approved to start build"
