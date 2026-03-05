@@ -18,10 +18,17 @@ jobs:
           server_port: 465
           username: ${{ secrets.MAIL_USERNAME }}
           password: ${{ secrets.MAIL_PASSWORD }}
-          subject: "Approval Required for Build Pipeline"
-          body: "A new code push to master requires approval before build starts."
-          to: durgasatyanarayana52@gmail.com
+          subject: "Approval Required: Build Pipeline"
+          to: manager@company.com
           from: GitHub-Actions
+          body: |
+            A new code push to master requires approval before build starts.
+
+            Please click the link below to review and approve the pipeline:
+
+            ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            After approval, the build process will start.
 
   approval-before-build:
     runs-on: ubuntu-latest
