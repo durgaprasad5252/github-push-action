@@ -3,7 +3,7 @@ name: Build, Scan, and Push Docker Image to ECR
 on:
   push:
     branches:
-      - dev_environment
+      - master
 
 env:
   AWS_REGION: us-east-1
