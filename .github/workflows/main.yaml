@@ -1,13 +1,22 @@
-name: CI Pipeline
+name: Build, Scan, and Push Docker Image to ECR
 
 on:
   push:
     branches:
-      - master
+      - dev_environment
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: user-service-docker
+
+permissions:
+  contents: write
+  id-token: write
 
 jobs:
 
   send-approval-mail:
+    name: Send Approval Email
     runs-on: ubuntu-latest
 
     steps:
@@ -16,36 +25,138 @@ jobs:
         with:
           server_address: smtp.gmail.com
           server_port: 465
+          secure: true
           username: ${{ secrets.MAIL_USERNAME }}
           password: ${{ secrets.MAIL_PASSWORD }}
-          subject: "Approval Required: Build Pipeline"
+          subject: "Approval Required: Dev Build Pipeline"
           to: durgasatyanarayana52@gmail.com
-          from: GitHub-Actions
+          from: ${{ secrets.MAIL_USERNAME }}
           body: |
-            A new code push to master requires approval before build starts.
+            A new push to dev_environment requires manual approval before the build starts.
 
-            Please click the link below to review and approve the pipeline:
-
+            Review the workflow here:
             ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
-            After approval, the build process will start.
-
   approval-before-build:
+    name: Manual Approval
     runs-on: ubuntu-latest
     needs: send-approval-mail
-    environment: build-approval
+
+    environment:
+      name: build-approval
 
     steps:
-      - name: Waiting for Approval
-        run: echo "Approved to start build"
+      - name: Waiting for Manual Approval
+        run: echo "Approval granted. Starting build..."
 
-  build:
+  build-scan-push:
+    name: Build Scan and Push
     runs-on: ubuntu-latest
     needs: approval-before-build
 
     steps:
-      - name: Checkout code
+
+      - name: Checkout Source Code
         uses: actions/checkout@v4
 
+      # Install Gitleaks
+      - name: Install Gitleaks
+        run: |
+          wget https://github.com/gitleaks/gitleaks/releases/download/v8.18.1/gitleaks_8.18.1_linux_x64.tar.gz
+          tar -xzf gitleaks_8.18.1_linux_x64.tar.gz
+          sudo mv gitleaks /usr/local/bin/
+
+      # Secret Scan
+      - name: Run Gitleaks Secret Scan
+        continue-on-error: true
+        run: gitleaks detect --redact --verbose
+
+      # Configure AWS
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::905418043476:role/GitHubECRAccessRole
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Docker setup
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Login to ECR
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Set Image Tag
+      - name: Set Image Tag
+        id: vars
+        run: |
+          IMAGE_TAG=$(echo $GITHUB_SHA | cut -c1-7)-dev
+          echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
+
+      # Build Docker Image
       - name: Build Docker Image
-        run: docker build -t nginx:latest .
+        run: |
+          docker build \
+          --build-arg AWS_ACCESS_KEY=${{ secrets.AWS_ACCESS_KEY }} \
+          --build-arg AWS_SECRET_KEY=${{ secrets.AWS_SECRET_KEY }} \
+          --build-arg AWS_BUCKET_NAME=${{ secrets.AWS_BUCKET_NAME }} \
+          --build-arg AWS_REGION=${{ secrets.AWS_REGION }} \
+          --build-arg APPLICATION_ENV=dev \
+          --build-arg DEV_MODE=${{ secrets.DEV_MODE }} \
+          --build-arg PORT=${{ secrets.PORT }} \
+          -t ${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }} .
+
+      # Trivy Image Scan
+      - name: Scan Docker Image with Trivy
+        uses: aquasecurity/trivy-action@0.20.0
+        with:
+          image-ref: ${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+          format: table
+          exit-code: 0
+          severity: CRITICAL,HIGH
+
+      # Tag Image
+      - name: Tag Docker Image
+        run: |
+          docker tag ${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }} \
+          ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+
+      # Push Image
+      - name: Push Image to ECR
+        run: |
+          docker push \
+          ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+
+      # Checkout Infra Repo
+      - name: Checkout Infra Repo
+        uses: actions/checkout@v4
+        with:
+          repository: GrowStack-ai/GrowStackAI-Infra
+          token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+          path: infra_repo
+          ref: main
+
+      # Update Helm values
+      - name: Update Helm values.yaml
+        working-directory: infra_repo
+        run: |
+          service="backend"
+          new_tag=${{ env.IMAGE_TAG }}
+          values_file="helm_growstack/values.yaml"
+
+          sed -i "/^[[:space:]]$service:/,/^[[:space:]]*port:/ s|^\([[:space:]]*tag:[[:space:]]\).*|\1${new_tag}|" "$values_file"
+
+          echo "Updated file:"
+          cat "$values_file"
+
+      # Commit Helm Changes
+      - name: Commit and Push Helm Changes
+        working-directory: infra_repo
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+
+          git add .
+          git diff --cached --quiet || git commit -m "Update backend image tag to $IMAGE_TAG"
+          git push origin main
