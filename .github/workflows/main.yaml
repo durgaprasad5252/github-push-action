@@ -34,7 +34,7 @@ jobs:
           token: ${{ steps.app-token.outputs.token }}
 
       - name: Test automation
-        run: echo "GitHub App authentication successful"
+        run: echo "GitHub App authentication successful-1"
 
       # Gitleaks scan
       - name: Scan repository for secrets (gitleaks)
