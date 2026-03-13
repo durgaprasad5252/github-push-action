@@ -3,6 +3,8 @@ name: Build, Scan, and Push Docker Image to ECR
 on:
   push:
     branches:
+      - dev_environment
+      - staging_environment
       - master
 
 env:
@@ -14,122 +16,110 @@ permissions:
   id-token: write
 
 jobs:
-
-  send-approval-mail:
-    name: Send Approval Email
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Send Approval Email
-        uses: dawidd6/action-send-mail@v3
-        with:
-          server_address: smtp.gmail.com
-          server_port: 465
-          secure: true
-          username: ${{ secrets.MAIL_USERNAME }}
-          password: ${{ secrets.MAIL_PASSWORD }}
-          subject: "Approval Required: Dev Build Pipeline"
-          to: durgasatyanarayana52@gmail.com
-          from: ${{ secrets.MAIL_USERNAME }}
-          body: |
-            A new push to dev_environment requires manual approval before the build starts.
-
-            Review the workflow here:
-            ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-
-  approval-before-build:
-    name: Manual Approval
-    runs-on: ubuntu-latest
-    needs: send-approval-mail
-
-    environment:
-      name: build-approval
-
-    steps:
-      - name: Waiting for Manual Approval
-        run: echo "Approval granted. Starting build..."
-
   build-scan-push:
-    name: Build Scan and Push
     runs-on: ubuntu-latest
-    needs: approval-before-build
 
     steps:
 
-      - name: Checkout Source Code
+      # Generate GitHub App token
+      - name: Generate GitHub App Token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      # Checkout repository using GitHub App token
+      - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          token: ${{ steps.app-token.outputs.token }}
 
-      # Install Gitleaks
-      - name: Install Gitleaks
-        run: |
-          wget https://github.com/gitleaks/gitleaks/releases/download/v8.18.1/gitleaks_8.18.1_linux_x64.tar.gz
-          tar -xzf gitleaks_8.18.1_linux_x64.tar.gz
-          sudo mv gitleaks /usr/local/bin/
+      - name: Test automation
+        run: echo "GitHub App authentication successful"
 
-      # Secret Scan
-      - name: Run Gitleaks Secret Scan
+      # Gitleaks scan
+      - name: Scan repository for secrets (gitleaks)
         continue-on-error: true
-        run: gitleaks detect --redact --verbose
+        run: |
+          curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v8.18.1/gitleaks_8.18.1_linux_x64.tar.gz | tar -xz
+          sudo mv gitleaks /usr/local/bin/gitleaks
+          gitleaks detect --redact --verbose
 
-      # Configure AWS
-      - name: Configure AWS Credentials
+      # Configure AWS credentials using OIDC
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::905418043476:role/GitHubECRAccessRole
           aws-region: ${{ env.AWS_REGION }}
 
-      # Docker setup
-      - name: Setup Docker Buildx
+      # Setup Docker
+      - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
       # Login to ECR
-      - name: Login to Amazon ECR
+      - name: Log in to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      # Set Image Tag
-      - name: Set Image Tag
+      # Detect environment from branch
+      - name: Determine environment and Helm values path
+        id: env
+        run: |
+          BRANCH="${GITHUB_REF_NAME}"
+          if [[ "$BRANCH" == "dev_environment" ]]; then
+            ENV="dev"
+            VALUES_FILE="helm_growstack/values.yaml"
+          elif [[ "$BRANCH" == "staging_environment" ]]; then
+            ENV="staging"
+            VALUES_FILE="staging_helm_growstack/values.yaml"
+          elif [[ "$BRANCH" == "master" ]]; then
+            ENV="prod"
+            VALUES_FILE="prod_helm_growstack/values.yaml"
+          else
+            echo "Unsupported branch"
+            exit 1
+          fi
+
+          echo "env_name=$ENV" >> "$GITHUB_OUTPUT"
+          echo "values_file=$VALUES_FILE" >> "$GITHUB_OUTPUT"
+
+      # Create image tag
+      - name: Set image tag
         id: vars
         run: |
-          IMAGE_TAG=$(echo $GITHUB_SHA | cut -c1-7)-dev
-          echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
+          IMAGE_TAG="$(echo $GITHUB_SHA | cut -c1-7)-${{ steps.env.outputs.env_name }}"
+          echo "IMAGE_TAG=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
 
       # Build Docker Image
-      - name: Build Docker Image
+      - name: Build Docker image
         run: |
           docker build \
-          --build-arg AWS_ACCESS_KEY=${{ secrets.AWS_ACCESS_KEY }} \
-          --build-arg AWS_SECRET_KEY=${{ secrets.AWS_SECRET_KEY }} \
-          --build-arg AWS_BUCKET_NAME=${{ secrets.AWS_BUCKET_NAME }} \
-          --build-arg AWS_REGION=${{ secrets.AWS_REGION }} \
-          --build-arg APPLICATION_ENV=dev \
-          --build-arg DEV_MODE=${{ secrets.DEV_MODE }} \
-          --build-arg PORT=${{ secrets.PORT }} \
-          -t ${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }} .
+            --build-arg AWS_ACCESS_KEY=${{ secrets.AWS_ACCESS_KEY }} \
+            --build-arg AWS_SECRET_KEY=${{ secrets.AWS_SECRET_KEY }} \
+            --build-arg AWS_BUCKET_NAME=${{ secrets.AWS_BUCKET_NAME }} \
+            --build-arg AWS_REGION=${{ secrets.AWS_REGION }} \
+            --build-arg APPLICATION_ENV=${{ steps.env.outputs.env_name }} \
+            --build-arg DEV_MODE=${{ secrets.DEV_MODE }} \
+            --build-arg PORT=${{ secrets.PORT }} \
+            -t $ECR_REPOSITORY:${{ steps.vars.outputs.IMAGE_TAG }} .
 
-      # Trivy Image Scan
-      - name: Scan Docker Image with Trivy
-        uses: aquasecurity/trivy-action@0.20.0
-        with:
-          image-ref: ${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
-          format: table
-          exit-code: 0
-          severity: CRITICAL,HIGH
-
-      # Tag Image
-      - name: Tag Docker Image
+      # Push Docker image
+      - name: Push image to ECR
         run: |
-          docker tag ${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }} \
-          ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+          docker tag $ECR_REPOSITORY:${{ steps.vars.outputs.IMAGE_TAG }} \
+          ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.vars.outputs.IMAGE_TAG }}
 
-      # Push Image
-      - name: Push Image to ECR
-        run: |
           docker push \
-          ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+          ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.vars.outputs.IMAGE_TAG }}
+
+      - name: Output final image URI
+        run: |
+          echo "Pushed image:"
+          echo "${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.vars.outputs.IMAGE_TAG }}"
 
       # Checkout Infra Repo
-      - name: Checkout Infra Repo
+      - name: Checkout Helm repo
         uses: actions/checkout@v4
         with:
           repository: GrowStack-ai/GrowStackAI-Infra
@@ -137,26 +127,28 @@ jobs:
           path: infra_repo
           ref: main
 
-      # Update Helm values
+      # Update Helm values.yaml
       - name: Update Helm values.yaml
         working-directory: infra_repo
         run: |
           service="backend"
-          new_tag=${{ env.IMAGE_TAG }}
-          values_file="helm_growstack/values.yaml"
+          new_tag=${{ steps.vars.outputs.IMAGE_TAG }}
+          values_file="${{ steps.env.outputs.values_file }}"
 
           sed -i "/^[[:space:]]$service:/,/^[[:space:]]*port:/ s|^\([[:space:]]*tag:[[:space:]]\).*|\1${new_tag}|" "$values_file"
 
-          echo "Updated file:"
           cat "$values_file"
 
-      # Commit Helm Changes
-      - name: Commit and Push Helm Changes
+      # Commit and push
+      - name: Commit and push updated values.yaml
         working-directory: infra_repo
         run: |
-          git config user.name "github-actions"
-          git config user.email "github-actions@github.com"
+          values_file="${{ steps.env.outputs.values_file }}"
+          new_tag=${{ steps.vars.outputs.IMAGE_TAG }}
 
-          git add .
-          git diff --cached --quiet || git commit -m "Update backend image tag to $IMAGE_TAG"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add "$values_file"
+          git diff --cached --quiet || git commit -m "Update backend image tag to ${new_tag}"
           git push origin main
