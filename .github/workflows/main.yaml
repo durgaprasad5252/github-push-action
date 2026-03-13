@@ -3,8 +3,6 @@ name: Build, Scan, and Push Docker Image to ECR
 on:
   push:
     branches:
-      - dev_environment
-      - staging_environment
       - master
 
 env:
